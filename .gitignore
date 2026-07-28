@@ -1,0 +1,56 @@
+# Entornos Python
+env/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Modelos entrenados
+*.joblib
+*.pkl
+*.npy
+*.npz
+
+# Archivos temporales
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Base datos Cetaqua
+BD.txt
+
+# Acosol
+Acosol/*.xlsx
+Acosol/*.xls
+Acosol/acosol_outputs_*/
+Acosol/model_outputs_*/
+Acosol/archive/
+Acosol/Modelo_Hidraulico_Mayo_2023
+
+# Benahavis
+Benahavis/gmail.txt
+
+# Huelva
+Huelva/THM_Depositos/
+Huelva/*.xlsx
+Huelva/*.xls
+Huelva/*.pdf
+Huelva/huelva_multiparam_sftp/
+Huelva/huelva_outputs_v*_thm_pdf/
+Huelva/huelva_par_etl_outputs_v*/
+Huelva/model_outputs_huelva_thm_softsensor_v*/
+Huelva/archive/
+Huelva/Notas.txt
+Huelva/config_private.py
+
+# Huesna
+Huesna/csv_descargados/
+Huesna/legacy_thm_audits/
+Huesna/model_outputs_thm_softsensor_v*/
+Huesna/outputs_softsensor_drift_analysis_v*/
+Huesna/Credenciales.txt
+Huesna/Notas.txt
+Huesna/config_private.py
+Huesna/hydraulic_propagation_reference/outputs*/
+Huesna/hydraulic_propagation_reference/figures*/
+Huesna/hydraulic_propagation_reference/docs/
+Huesna/hydraulic_propagation_reference/epanet_model/
