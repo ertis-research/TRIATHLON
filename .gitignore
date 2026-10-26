@@ -19,15 +19,31 @@ Thumbs.db
 BD.txt
 
 # Acosol
+Acosol/config_private.py
+Acosol/*.csv
+Acosol/**/*.csv
 Acosol/*.xlsx
+Acosol/**/*.xlsx
 Acosol/*.xls
+Acosol/**/*.xls
+Acosol/*.parquet
+Acosol/**/*.parquet
+Acosol/*.feather
+Acosol/**/*.feather
+Acosol/sftp_raw/
 Acosol/acosol_outputs_*/
+Acosol/acosol_sftp_dataset_*/
 Acosol/model_outputs_*/
+Acosol/sftp_audit_*/
 Acosol/archive/
-Acosol/Modelo_Hidraulico_Mayo_2023
+Acosol/Modelo_Hidraulico_Mayo_2023/
+Acosol/experiments/
+Acosol/Validation/*.docx
 
 # Benahavis
 Benahavis/gmail.txt
+Benahavis/Nautilus_GISAgua/
+Benahavis/Resultados.csv
 
 # Huelva
 Huelva/THM_Depositos/
@@ -41,6 +57,14 @@ Huelva/model_outputs_huelva_thm_softsensor_v*/
 Huelva/archive/
 Huelva/Notas.txt
 Huelva/config_private.py
+Huelva/huesna_transfer/outputs/
+Huelva/huelva_transfer_outputs_v*/
+Huelva/huelva_transfer_formal_outputs_v*/
+Huelva/huelva_few_shot_outputs_v*/
+Huelva/huelva_fixed_holdout_outputs_v*/
+Huelva/huelva_blocked_walkforward_outputs_v*/
+Huelva/Validation/*.docx
+Huelva/experiments/*/outputs/
 
 # Huesna
 Huesna/csv_descargados/
@@ -54,3 +78,6 @@ Huesna/hydraulic_propagation_reference/outputs*/
 Huesna/hydraulic_propagation_reference/figures*/
 Huesna/hydraulic_propagation_reference/docs/
 Huesna/hydraulic_propagation_reference/epanet_model/
+Huesna/outputs_thm_range_audit_v*/
+Huesna/Validation/*.docx
+Huesna/frozen_models/

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-THM v5.8.8 - Soft sensor HGB dinámico con auditoría de calidad trazable y textos consolidados.
+THM v5.8.12 - Soft sensor HGB dinámico con incidencias confirmadas por feature.
 
 Objetivo:
     Estimar THM(t) a partir de las variables de la multiparamétrica,
@@ -17,7 +17,7 @@ Enfoque actual:
     3) Modelo principal operativo:
        - HistGradientBoostingRegressor global.
        - Selección de hiperparámetros en validación.
-       - Selección de variante de calendario según validación HGB.
+       - Selección de variante de calendario mediante validación temporal múltiple HGB.
        - Evaluación final en test.
     4) Baselines de control de calidad:
        - Dummy median.
@@ -35,7 +35,9 @@ Enfoque actual:
     7) Auditoría de calidad de dato:
        - separa ausencia de THM alineado de THM anómalo real;
        - guarda filas THM descartadas por reglas de valor;
-       - guarda filas X centinela detectadas antes de reparar lags/rolling.
+       - guarda filas X centinela detectadas antes de reparar lags/rolling;
+       - exporta cada valor X fuera de rango físico con timestamp y valor bruto;
+       - detecta glitches THM extremadamente altos de forma relativa al histórico causal.
     8) Exportación de depuración:
        - guarda las features de test usadas por el HGB para diagnóstico de régimen/sesgo.
 
@@ -76,8 +78,19 @@ TARGET_METRIC_CANDIDATES = [
     "Trihalometanos", "Trihalometano", "THM", "THMs", "TTHM", "TTHMs",
     "Trihalomethanes", "Total Trihalomethanes"
 ]
-DEFAULT_OUTPUT_DIR = "model_outputs_thm_softsensor_v5_8_5_hgb_dynamic_windows_quality_audit"
+DEFAULT_OUTPUT_DIR = "model_outputs_thm_softsensor_v5_8_12_incidents"
 DEFAULT_MIN_VALID_TARGET = 0.1
+
+# Detector técnico de glitches THM extremadamente altos. No es un máximo global
+# de THM: solo invalida valores enormes que además son incompatibles con la
+# mediana causal de las horas anteriores. Así se conserva un posible episodio
+# real de THM alto (80, 100, etc.) y se evita que picos de instrumentación como
+# 1999.8 contaminen el entrenamiento.
+TARGET_EXTREME_GLITCH_HISTORY_MINUTES = 360
+TARGET_EXTREME_GLITCH_MIN_HISTORY_POINTS = 30
+TARGET_EXTREME_GLITCH_MIN_VALUE = 500.0
+TARGET_EXTREME_GLITCH_MIN_RATIO = 10.0
+TARGET_EXTREME_GLITCH_MIN_DELTA = 250.0
 
 # Rangos físicos amplios para limpiar glitches evidentes antes de construir lags/rolling.
 # No son umbrales normativos de calidad de agua. Son barreras técnicas para evitar
@@ -521,6 +534,7 @@ def sanitize_current_features(
     segment_ids: pd.Series,
     enabled: bool = True,
     ffill_limit: int = 10,
+    confirmed_feature_intervals: Optional[Sequence[Dict[str, object]]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, object]]:
     """Limpia glitches evidentes en variables de entrada antes de crear histórico.
 
@@ -543,12 +557,63 @@ def sanitize_current_features(
         "row_sentinel_min_hits": int(ROW_SENTINEL_MIN_HITS),
         "row_sentinel_rows_cleaned": 0,
         "row_sentinel_timestamps": [],
+        "physical_anomaly_records": [],
+        "confirmed_feature_incident_records": [],
+        "confirmed_feature_incident_values_cleaned": 0,
+        "confirmed_feature_incident_intervals": list(confirmed_feature_intervals or []),
         "by_feature": {},
     }
-    if not enabled:
-        return out, meta
-
     numeric = out.apply(pd.to_numeric, errors="coerce")
+
+    # v5.8.12: incidencias confirmadas por planta que afectan solo a una feature.
+    # Se aplican antes de construir lags/rollings y se vuelven a imponer tras el
+    # relleno corto para que una incidencia larga no pueda reconstruirse por ffill/bfill.
+    confirmed_masks: Dict[str, pd.Series] = {
+        str(col): pd.Series(False, index=out.index, dtype=bool) for col in out.columns
+    }
+    for interval in list(confirmed_feature_intervals or []):
+        feature = str(interval.get("feature", "")).strip()
+        if not feature:
+            continue
+        matches = [c for c in out.columns if str(c).casefold() == feature.casefold()]
+        if not matches:
+            continue
+        col = str(matches[0])
+        start_ts = pd.Timestamp(interval["start"])
+        end_ts = pd.Timestamp(interval["end"])
+        mask = pd.Series((out.index >= start_ts) & (out.index <= end_ts), index=out.index)
+        nonnull_mask = mask & numeric[col].notna()
+        confirmed_masks[col] = confirmed_masks[col] | mask
+        for ts, value in numeric.loc[nonnull_mask, col].items():
+            meta["confirmed_feature_incident_records"].append({
+                "timestamp": str(ts),
+                "feature": col,
+                "value": float(value),
+                "label": str(interval.get("label", "confirmed_feature_incident")),
+                "start": str(start_ts),
+                "end": str(end_ts),
+                "notes": str(interval.get("notes", "")),
+                "source": str(interval.get("source", "unknown")),
+            })
+        numeric.loc[mask, col] = np.nan
+
+    if not enabled:
+        # Las incidencias confirmadas por planta siguen aplicándose aunque se desactive
+        # la limpieza heurística de outliers/sentinelas.
+        for col in numeric.columns:
+            out[col] = numeric[col].reindex(out.index)
+            confirmed_count = int((confirmed_masks[str(col)] & current_df[col].notna()).sum())
+            meta["by_feature"][col] = {
+                "values_cleaned": confirmed_count,
+                "confirmed_feature_incident_values_cleaned": confirmed_count,
+                "row_sentinel_values_cleaned": 0,
+                "physical_values_cleaned": 0,
+                "physical_bounds": FEATURE_PHYSICAL_BOUNDS.get(str(col)),
+                "sentinel_rule": FEATURE_SENTINEL_RULES.get(str(col)),
+            }
+            meta["total_values_cleaned"] += confirmed_count
+            meta["confirmed_feature_incident_values_cleaned"] += confirmed_count
+        return out, meta
 
     sentinel_hits = pd.DataFrame(index=out.index)
     for col in numeric.columns:
@@ -581,13 +646,29 @@ def sanitize_current_features(
         s = pd.to_numeric(numeric[col], errors="coerce")
         invalid = pd.Series(False, index=out.index)
 
-        # Cuenta como limpiado por fila centinela si esa fila tenía valor no nulo originalmente.
-        row_sentinel_cleaned_count = int((row_invalid & out[col].notna()).sum())
+        confirmed_mask = confirmed_masks.get(str(col), pd.Series(False, index=out.index, dtype=bool))
+        confirmed_cleaned_count = int((confirmed_mask & out[col].notna()).sum())
+
+        # Evita doble conteo cuando una fila coincide con una incidencia confirmada
+        # y además cumple el patrón centinela.
+        row_sentinel_cleaned_count = int((row_invalid & out[col].notna() & ~confirmed_mask).sum())
 
         bounds = FEATURE_PHYSICAL_BOUNDS.get(str(col))
         if bounds is not None:
             low, high = bounds
-            invalid = invalid | (s < low) | (s > high)
+            physical_invalid = ((s < low) | (s > high)).fillna(False)
+            if physical_invalid.any():
+                records = meta.setdefault("physical_anomaly_records", [])
+                for ts, value in s.loc[physical_invalid].items():
+                    records.append({
+                        "timestamp": str(ts),
+                        "feature": str(col),
+                        "value": None if pd.isna(value) else float(value),
+                        "lower_bound": float(low),
+                        "upper_bound": float(high),
+                        "rule": f"value < {float(low)} or value > {float(high)}",
+                    })
+            invalid = invalid | physical_invalid
 
         physical_cleaned_count = int(invalid.fillna(False).sum())
         if physical_cleaned_count:
@@ -601,16 +682,21 @@ def sanitize_current_features(
         if repaired_parts:
             s = pd.concat(repaired_parts).sort_index()
 
+        # La incidencia confirmada prevalece sobre la reparación corta.
+        s = s.mask(confirmed_mask)
+
         out[col] = s.reindex(out.index)
-        total_col_cleaned = row_sentinel_cleaned_count + physical_cleaned_count
+        total_col_cleaned = confirmed_cleaned_count + row_sentinel_cleaned_count + physical_cleaned_count
         meta["by_feature"][col] = {
             "values_cleaned": int(total_col_cleaned),
+            "confirmed_feature_incident_values_cleaned": int(confirmed_cleaned_count),
             "row_sentinel_values_cleaned": int(row_sentinel_cleaned_count),
             "physical_values_cleaned": int(physical_cleaned_count),
             "physical_bounds": bounds,
             "sentinel_rule": FEATURE_SENTINEL_RULES.get(str(col)),
         }
         meta["total_values_cleaned"] += int(total_col_cleaned)
+        meta["confirmed_feature_incident_values_cleaned"] += int(confirmed_cleaned_count)
 
     return out, meta
 
@@ -618,50 +704,112 @@ def clean_target_series(
     y: pd.Series,
     min_valid_target: float = DEFAULT_MIN_VALID_TARGET,
     max_valid_target: Optional[float] = None,
+    clean_extreme_glitches: bool = True,
 ) -> Tuple[pd.Series, Dict[str, object]]:
-    """Elimina valores objetivo no válidos antes de entrenar/evaluar.
+    """Elimina valores objetivo técnicamente no válidos antes de entrenar/evaluar.
 
-    En los datos recientes aparecen lecturas aisladas de THM = 0 mientras el
-    entorno real está ~10-12. Esas lecturas no son representativas y pueden
-    distorsionar validación, gráficas y aprendizaje. Por defecto se descarta
-    THM <= 0.1. Se puede desactivar con --min-valid-target 0.
+    Se mantienen las reglas explícitas min/max. Además, por defecto se detectan
+    glitches THM extremadamente altos de forma relativa al histórico inmediato.
+    Este detector NO impone un máximo global de THM: exige simultáneamente un
+    valor absoluto enorme, un salto grande y una relación extrema frente a la
+    mediana causal de las 6 h anteriores.
     """
     out = pd.to_numeric(y, errors="coerce").copy()
     invalid_value = pd.Series(False, index=out.index)
+    anomaly_rule_by_index: Dict[object, List[str]] = {}
+    anomaly_context_by_index: Dict[object, Dict[str, object]] = {}
+
     if min_valid_target is not None:
-        invalid_value = invalid_value | (out <= float(min_valid_target))
+        mask = (out <= float(min_valid_target)).fillna(False)
+        invalid_value = invalid_value | mask
+        for ts in out.index[mask]:
+            anomaly_rule_by_index.setdefault(ts, []).append(f"value <= {float(min_valid_target)}")
+
     if max_valid_target is not None:
-        invalid_value = invalid_value | (out > float(max_valid_target))
+        mask = (out > float(max_valid_target)).fillna(False)
+        invalid_value = invalid_value | mask
+        for ts in out.index[mask]:
+            anomaly_rule_by_index.setdefault(ts, []).append(f"value > {float(max_valid_target)}")
+
+    extreme_mask = pd.Series(False, index=out.index)
+    trailing_median = pd.Series(np.nan, index=out.index, dtype=float)
+    if clean_extreme_glitches and out.notna().any():
+        history_source = out.shift(1)
+        try:
+            if isinstance(out.index, pd.DatetimeIndex):
+                trailing_median = history_source.rolling(
+                    f"{int(TARGET_EXTREME_GLITCH_HISTORY_MINUTES)}min",
+                    min_periods=int(TARGET_EXTREME_GLITCH_MIN_HISTORY_POINTS),
+                ).median()
+            else:
+                trailing_median = history_source.rolling(
+                    window=int(TARGET_EXTREME_GLITCH_HISTORY_MINUTES),
+                    min_periods=int(TARGET_EXTREME_GLITCH_MIN_HISTORY_POINTS),
+                ).median()
+        except Exception:
+            trailing_median = history_source.rolling(
+                window=int(TARGET_EXTREME_GLITCH_HISTORY_MINUTES),
+                min_periods=int(TARGET_EXTREME_GLITCH_MIN_HISTORY_POINTS),
+            ).median()
+
+        positive_reference = trailing_median.clip(lower=1e-6)
+        extreme_mask = (
+            out.notna()
+            & trailing_median.notna()
+            & (out >= float(TARGET_EXTREME_GLITCH_MIN_VALUE))
+            & ((out - trailing_median) >= float(TARGET_EXTREME_GLITCH_MIN_DELTA))
+            & ((out / positive_reference) >= float(TARGET_EXTREME_GLITCH_MIN_RATIO))
+        ).fillna(False)
+        invalid_value = invalid_value | extreme_mask
+        for ts in out.index[extreme_mask]:
+            median_value = trailing_median.loc[ts]
+            anomaly_rule_by_index.setdefault(ts, []).append("extreme_glitch_vs_trailing_median")
+            anomaly_context_by_index[ts] = {
+                "trailing_median": None if pd.isna(median_value) else float(median_value),
+                "history_minutes": int(TARGET_EXTREME_GLITCH_HISTORY_MINUTES),
+                "min_value": float(TARGET_EXTREME_GLITCH_MIN_VALUE),
+                "min_ratio": float(TARGET_EXTREME_GLITCH_MIN_RATIO),
+                "min_delta": float(TARGET_EXTREME_GLITCH_MIN_DELTA),
+            }
+
     invalid_missing = out.isna()
     invalid = invalid_value | invalid_missing
 
     anomaly_records = []
     for ts, value in out.loc[invalid_value & out.notna()].items():
-        rules = []
-        if min_valid_target is not None and value <= float(min_valid_target):
-            rules.append(f"value <= {float(min_valid_target)}")
-        if max_valid_target is not None and value > float(max_valid_target):
-            rules.append(f"value > {float(max_valid_target)}")
+        context = anomaly_context_by_index.get(ts, {})
         anomaly_records.append({
             "timestamp": str(ts),
             "target": TARGET_COL,
             "value": float(value),
-            "rule": " | ".join(rules),
+            "rule": " | ".join(anomaly_rule_by_index.get(ts, [])),
+            "trailing_median": context.get("trailing_median"),
+            "extreme_history_minutes": context.get("history_minutes"),
+            "extreme_min_value": context.get("min_value"),
+            "extreme_min_ratio": context.get("min_ratio"),
+            "extreme_min_delta": context.get("min_delta"),
         })
 
     meta = {
         "min_valid_target": None if min_valid_target is None else float(min_valid_target),
         "max_valid_target": None if max_valid_target is None else float(max_valid_target),
+        "extreme_glitch_cleaning_enabled": bool(clean_extreme_glitches),
+        "extreme_glitch_history_minutes": int(TARGET_EXTREME_GLITCH_HISTORY_MINUTES),
+        "extreme_glitch_min_history_points": int(TARGET_EXTREME_GLITCH_MIN_HISTORY_POINTS),
+        "extreme_glitch_min_value": float(TARGET_EXTREME_GLITCH_MIN_VALUE),
+        "extreme_glitch_min_ratio": float(TARGET_EXTREME_GLITCH_MIN_RATIO),
+        "extreme_glitch_min_delta": float(TARGET_EXTREME_GLITCH_MIN_DELTA),
         "rows_invalid_target": int(invalid.sum()),
         "rows_invalid_target_missing": int(invalid_missing.sum()),
         "rows_invalid_target_value_rules": int((invalid_value & out.notna()).sum()),
+        "rows_invalid_target_extreme_glitch": int(extreme_mask.sum()),
         "target_anomaly_records": anomaly_records,
     }
     out = out.mask(invalid)
     return out, meta
 
 
-def build_data_quality_report(primary_res: Dict[str, object]) -> Tuple[Dict[str, object], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def build_data_quality_report(primary_res: Dict[str, object]) -> Tuple[Dict[str, object], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Construye un pequeño reporte de calidad de dato para justificar limpiezas."""
     feature_cleaning_meta = dict(primary_res.get("feature_cleaning_meta", {}) or {})
     target_cleaning_meta = dict(primary_res.get("target_cleaning_meta", {}) or {})
@@ -688,6 +836,8 @@ def build_data_quality_report(primary_res: Dict[str, object]) -> Tuple[Dict[str,
             "rows_invalid_total_before_dropna": rows_invalid_target_total,
             "rows_invalid_due_to_missing_alignment": rows_without_target_alignment,
             "rows_invalid_due_to_value_rules": rows_invalid_target_value_rules,
+            "rows_invalid_extreme_glitch": int(target_cleaning_meta.get("rows_invalid_target_extreme_glitch", 0) or 0),
+            "extreme_glitch_cleaning_enabled": bool(target_cleaning_meta.get("extreme_glitch_cleaning_enabled", False)),
         },
         "feature_cleaning": {
             "total_values_cleaned": int(feature_cleaning_meta.get("total_values_cleaned", 0) or 0),
@@ -695,6 +845,9 @@ def build_data_quality_report(primary_res: Dict[str, object]) -> Tuple[Dict[str,
             "row_sentinel_timestamps_preview": row_sentinel_timestamps_preview,
             "row_sentinel_timestamps_preview_count": row_sentinel_timestamps_preview_count,
             "row_sentinel_timestamps_total": len(row_sentinel_timestamps),
+            "physical_anomaly_values": len(list(feature_cleaning_meta.get("physical_anomaly_records", []) or [])),
+            "confirmed_feature_incident_values_cleaned": int(feature_cleaning_meta.get("confirmed_feature_incident_values_cleaned", 0) or 0),
+            "confirmed_feature_incident_intervals": list(feature_cleaning_meta.get("confirmed_feature_incident_intervals", []) or []),
         },
         "rows_lost_after_feature_engineering_dropna": rows_lost_feature_eng,
     }
@@ -704,7 +857,9 @@ def build_data_quality_report(primary_res: Dict[str, object]) -> Tuple[Dict[str,
         {"category": "target", "metric": "rows_without_target_alignment", "value": rows_without_target_alignment, "detail": "Filas sin THM alineado; no son anomalías, solo ausencia de objetivo"},
         {"category": "target", "metric": "rows_invalid_target_total_before_dropna", "value": rows_invalid_target_total, "detail": "Total marcado como inválido por limpieza del objetivo antes de dropna"},
         {"category": "target", "metric": "rows_invalid_due_to_value_rules", "value": rows_invalid_target_value_rules, "detail": "THM descartados por valor inválido/anómalo (sin contar ausencia de alineación)"},
-        {"category": "features", "metric": "total_values_cleaned", "value": int(feature_cleaning_meta.get("total_values_cleaned", 0) or 0), "detail": "Valores X limpiados por reglas físicas o centinelas"},
+        {"category": "target", "metric": "rows_invalid_extreme_glitch", "value": int(target_cleaning_meta.get("rows_invalid_target_extreme_glitch", 0) or 0), "detail": "THM descartados por glitch extremo frente a mediana causal; no es un máximo global"},
+        {"category": "features", "metric": "total_values_cleaned", "value": int(feature_cleaning_meta.get("total_values_cleaned", 0) or 0), "detail": "Valores X limpiados por incidencias confirmadas, reglas físicas o centinelas"},
+        {"category": "features", "metric": "confirmed_feature_incident_values_cleaned", "value": int(feature_cleaning_meta.get("confirmed_feature_incident_values_cleaned", 0) or 0), "detail": "Valores X invalidados por intervalos de feature confirmados por planta"},
         {"category": "features", "metric": "row_sentinel_rows_cleaned", "value": int(feature_cleaning_meta.get("row_sentinel_rows_cleaned", 0) or 0), "detail": "Filas donde se limpió una fila completa por patrón centinela"},
         {"category": "features", "metric": "rows_lost_after_feature_engineering_dropna", "value": rows_lost_feature_eng, "detail": "Filas descartadas después de construir features por NaN residual"},
     ]
@@ -716,6 +871,7 @@ def build_data_quality_report(primary_res: Dict[str, object]) -> Tuple[Dict[str,
         feature_rows.append({
             "feature": feat,
             "values_cleaned": int(meta.get("values_cleaned", 0) or 0),
+            "confirmed_feature_incident_values_cleaned": int(meta.get("confirmed_feature_incident_values_cleaned", 0) or 0),
             "row_sentinel_values_cleaned": int(meta.get("row_sentinel_values_cleaned", 0) or 0),
             "physical_values_cleaned": int(meta.get("physical_values_cleaned", 0) or 0),
             "physical_bounds": json.dumps(meta.get("physical_bounds"), ensure_ascii=False),
@@ -729,11 +885,19 @@ def build_data_quality_report(primary_res: Dict[str, object]) -> Tuple[Dict[str,
     if target_anomalies_df.empty:
         target_anomalies_df = pd.DataFrame(columns=["timestamp", "target", "value", "rule"])
 
+    physical_anomalies_df = pd.DataFrame(list(feature_cleaning_meta.get("physical_anomaly_records", []) or []))
+    if physical_anomalies_df.empty:
+        physical_anomalies_df = pd.DataFrame(
+            columns=["timestamp", "feature", "value", "lower_bound", "upper_bound", "rule"]
+        )
+    elif {"feature", "timestamp"}.issubset(physical_anomalies_df.columns):
+        physical_anomalies_df = physical_anomalies_df.sort_values(["feature", "timestamp"]).reset_index(drop=True)
+
     x_sentinel_df = pd.DataFrame(list(feature_cleaning_meta.get("row_sentinel_records", []) or []))
     if x_sentinel_df.empty:
         x_sentinel_df = pd.DataFrame(columns=["timestamp", "sentinel_hit_count"])
 
-    return report, summary_df, feature_df, target_anomalies_df, x_sentinel_df
+    return report, summary_df, feature_df, target_anomalies_df, physical_anomalies_df, x_sentinel_df
 
 
 def add_calendar_features(df: pd.DataFrame, mode: str = "all") -> pd.DataFrame:
@@ -768,7 +932,9 @@ def build_feature_table(wide_reg: pd.DataFrame,
                         clean_feature_outliers: bool = True,
                         feature_clean_ffill_limit: int = 10,
                         min_valid_target: float = DEFAULT_MIN_VALID_TARGET,
-                        max_valid_target: Optional[float] = None) -> Tuple[pd.DataFrame, List[str], List[str]]:
+                        max_valid_target: Optional[float] = None,
+                        clean_extreme_target_glitches: bool = True,
+                        confirmed_feature_intervals: Optional[Sequence[Dict[str, object]]] = None) -> Tuple[pd.DataFrame, List[str], List[str]]:
     if TARGET_COL not in wide_reg.columns:
         raise ValueError(f"No existe la columna objetivo '{TARGET_COL}' en los datos ya alineados")
 
@@ -783,6 +949,7 @@ def build_feature_table(wide_reg: pd.DataFrame,
         segment_ids=wide_reg["segment_id"],
         enabled=bool(clean_feature_outliers),
         ffill_limit=int(feature_clean_ffill_limit),
+        confirmed_feature_intervals=confirmed_feature_intervals,
     )
 
     calendar_df = add_calendar_features(pd.DataFrame(index=wide_reg.index), mode=calendar_mode)
@@ -824,6 +991,7 @@ def build_feature_table(wide_reg: pd.DataFrame,
         wide_reg[TARGET_COL],
         min_valid_target=min_valid_target,
         max_valid_target=max_valid_target,
+        clean_extreme_glitches=clean_extreme_target_glitches,
     )
 
     seg = wide_reg["segment_id"]
@@ -1386,7 +1554,7 @@ def export_feature_debug_tables(output_dir: Path,
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="THM v5.8.8 - Soft sensor HGB dinámico con auditoría de calidad trazable")
+    p = argparse.ArgumentParser(description="THM v5.8.12 - Soft sensor HGB dinámico con incidencias confirmadas por feature")
     p.add_argument("--csv-dir", default="csv_descargados", help="Carpeta con CSVs")
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Carpeta de salida")
     p.add_argument("--sensor", default=TARGET_SENSOR, help="Sensor de la multiparamétrica (features)")
@@ -1420,6 +1588,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--feature-clean-ffill-limit", type=int, default=10, help="Relleno máximo tras limpiar glitches de variables X")
     p.add_argument("--min-valid-target", type=float, default=DEFAULT_MIN_VALID_TARGET, help="Descarta THM <= este valor antes de entrenar/evaluar; usa 0 para desactivar")
     p.add_argument("--max-valid-target", type=float, default=None, help="Descarta THM > este valor si se define")
+    p.add_argument(
+        "--disable-extreme-target-glitch-cleaning",
+        action="store_true",
+        help=(
+            "Desactiva el detector técnico de picos THM extremadamente altos frente a la mediana causal. "
+            "No afecta a --min-valid-target/--max-valid-target."
+        ),
+    )
     p.add_argument("--current-only", action="store_true", help="Usar solo lectura instantánea de la multiparamétrica")
     p.add_argument("--max-history-minutes", type=int, default=240, help="Buffer histórico de multiparamétrica si no se usa --current-only")
     p.add_argument(
@@ -1427,6 +1603,42 @@ def parse_args() -> argparse.Namespace:
         choices=["compare", "all", "no_doy", "no_calendar"],
         default="compare",
         help="compare evalúa all/no_doy/no_calendar; el resto fuerza una variante fija",
+    )
+    p.add_argument(
+        "--calendar-selection-mode",
+        choices=["single", "multi"],
+        default="multi",
+        help=(
+            "single usa solo la validación inmediatamente anterior al test; multi hace un "
+            "backtest rolling-origin sobre varias ventanas temporales sin tocar el test final"
+        ),
+    )
+    p.add_argument(
+        "--calendar-multival-folds",
+        type=int,
+        default=4,
+        help="Número de ventanas temporales consecutivas para seleccionar la variante de calendario",
+    )
+    p.add_argument(
+        "--calendar-multival-window-days",
+        type=float,
+        default=None,
+        help="Duración de cada fold temporal; por defecto usa --val-window-days",
+    )
+    p.add_argument(
+        "--calendar-multival-min-folds",
+        type=int,
+        default=3,
+        help="Número mínimo de folds válidos por variante para usar selección multitemporal",
+    )
+    p.add_argument(
+        "--calendar-prefer-all-tolerance",
+        type=float,
+        default=0.05,
+        help=(
+            "Tolerancia relativa: si all_calendar queda dentro de este margen respecto a la "
+            "mejor RMSE multitemporal media, se prefiere por robustez estacional"
+        ),
     )
     p.add_argument(
         "--acceptance-min-rmse-improvement",
@@ -1439,6 +1651,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.85,
         help="Máximo |bias|/RMSE permitido en validación para considerar HGB sin aviso",
+    )
+
+    p.add_argument(
+        "--feature-incident-intervals-csv",
+        default=None,
+        help=(
+            "CSV con incidencias confirmadas que afectan solo a una feature. "
+            "Columnas obligatorias: start,end,feature. Opcionales: sensor,label,notes. "
+            "La feature se invalida solo dentro del intervalo antes de crear lags/rollings."
+        ),
     )
 
     p.add_argument(
@@ -1657,7 +1879,7 @@ def select_primary_calendar_variant_robust(include_results: List[Dict[str, objec
             )
 
     meta = {
-        "policy": "v5.8.8_robust_calendar_selection",
+        "policy": "v5.8.12_robust_calendar_selection",
         "selection_uses_test": False,
         "best_by_validation_variant_label": best_by_val.get("variant_label"),
         "best_by_validation_variant_mode": best_by_val.get("variant_mode"),
@@ -1677,6 +1899,361 @@ def select_primary_calendar_variant_robust(include_results: List[Dict[str, objec
     }
     return selected, meta
 
+
+def _calendar_multival_fold_specs(
+    model_df: pd.DataFrame,
+    final_test_start: pd.Timestamp,
+    n_folds: int,
+    window_days: float,
+    train_history_days: float,
+    min_train_rows: int,
+    min_val_rows: int,
+) -> List[Dict[str, object]]:
+    """Construye folds rolling-origin anteriores al test final.
+
+    Cada fold usa como train exclusivamente datos anteriores a su ventana de
+    validación. Con train_history_days=0 el histórico es expansivo: cada fold
+    incorpora todo lo disponible hasta ese momento. El test final nunca entra
+    en estos folds.
+    """
+    if n_folds <= 0:
+        raise ValueError("--calendar-multival-folds debe ser > 0")
+    if window_days <= 0:
+        raise ValueError("--calendar-multival-window-days debe ser > 0")
+    if train_history_days < 0:
+        raise ValueError("--train-history-days debe ser >= 0")
+
+    df = model_df.sort_index()
+    fold_specs: List[Dict[str, object]] = []
+    delta = pd.Timedelta(days=float(window_days))
+
+    for fold_idx in range(1, int(n_folds) + 1):
+        # fold 1 = el más antiguo; fold N = el inmediatamente anterior al test.
+        periods_before_test = int(n_folds) - fold_idx
+        val_end = pd.Timestamp(final_test_start) - periods_before_test * delta
+        val_start = val_end - delta
+
+        if train_history_days and train_history_days > 0:
+            train_start = val_start - pd.Timedelta(days=float(train_history_days))
+            train_mask = (df.index >= train_start) & (df.index < val_start)
+        else:
+            train_start = df.index.min()
+            train_mask = df.index < val_start
+        val_mask = (df.index >= val_start) & (df.index < val_end)
+
+        train_rows = int(train_mask.sum())
+        val_rows = int(val_mask.sum())
+        valid = train_rows >= int(min_train_rows) and val_rows >= int(min_val_rows)
+        reason = "OK"
+        if train_rows < int(min_train_rows):
+            reason = f"train_rows<{int(min_train_rows)}"
+        elif val_rows < int(min_val_rows):
+            reason = f"val_rows<{int(min_val_rows)}"
+
+        fold_specs.append({
+            "fold": int(fold_idx),
+            "train_start_requested": str(train_start),
+            "train_end_requested": str(val_start),
+            "val_start_requested": str(val_start),
+            "val_end_requested": str(val_end),
+            "train_rows": train_rows,
+            "val_rows": val_rows,
+            "valid": bool(valid),
+            "reason": reason,
+            "train_mask": train_mask,
+            "val_mask": val_mask,
+        })
+
+    return fold_specs
+
+
+def evaluate_calendar_multitemporal(
+    selectable_results: List[Dict[str, object]],
+    args: argparse.Namespace,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    """Backtest temporal de las variantes de calendario sin usar el test final.
+
+    Para mantener el coste razonable, cada variante conserva los hiperparámetros
+    HGB ya seleccionados con la validación más reciente. Esos parámetros se
+    reentrenan desde cero en cada fold usando solo el histórico disponible antes
+    del fold. La selección del calendario se hace después con la RMSE media de
+    los folds válidos.
+    """
+    if not selectable_results:
+        raise ValueError("No hay variantes para validación temporal múltiple")
+
+    reference = selectable_results[0]
+    test_df = reference.get("test_df")
+    if not isinstance(test_df, pd.DataFrame) or test_df.empty:
+        raise ValueError("No se puede determinar el inicio del test final")
+    final_test_start = pd.Timestamp(test_df.index.min())
+    window_days = (
+        float(args.calendar_multival_window_days)
+        if args.calendar_multival_window_days is not None
+        else float(args.val_window_days)
+    )
+
+    fold_specs = _calendar_multival_fold_specs(
+        model_df=reference["model_df"],
+        final_test_start=final_test_start,
+        n_folds=int(args.calendar_multival_folds),
+        window_days=window_days,
+        train_history_days=float(args.train_history_days),
+        min_train_rows=int(args.min_train_rows),
+        min_val_rows=int(args.min_val_rows),
+    )
+
+    valid_specs = [f for f in fold_specs if bool(f["valid"])]
+    if len(valid_specs) < int(args.calendar_multival_min_folds):
+        raise RuntimeError(
+            "Validación temporal múltiple insuficiente: "
+            f"{len(valid_specs)} folds válidos < mínimo {int(args.calendar_multival_min_folds)}"
+        )
+
+    rows: List[Dict[str, object]] = []
+    for res in selectable_results:
+        model_df = res["model_df"].sort_index()
+        feature_cols = list(res["model_feature_cols"])
+        params = dict(res["best_params"])
+
+        for spec in valid_specs:
+            # Las máscaras se reconstruyen sobre el índice de cada variante para
+            # no depender de identidad de objetos entre DataFrames.
+            val_start = pd.Timestamp(spec["val_start_requested"])
+            val_end = pd.Timestamp(spec["val_end_requested"])
+            if args.train_history_days and args.train_history_days > 0:
+                train_start = val_start - pd.Timedelta(days=float(args.train_history_days))
+                train_mask = (model_df.index >= train_start) & (model_df.index < val_start)
+            else:
+                train_mask = model_df.index < val_start
+            val_mask = (model_df.index >= val_start) & (model_df.index < val_end)
+
+            train_df = model_df.loc[train_mask].copy()
+            val_df = model_df.loc[val_mask].copy()
+            if len(train_df) < int(args.min_train_rows) or len(val_df) < int(args.min_val_rows):
+                continue
+
+            y_train = train_df[TARGET_COL].to_numpy(dtype=float)
+            y_val = val_df[TARGET_COL].to_numpy(dtype=float)
+            abs_change_train = train_df["thm_change_abs"].to_numpy(dtype=float)
+            abs_change_val = val_df["thm_change_abs"].to_numpy(dtype=float)
+
+            if args.high_threshold_mode == "fixed":
+                if args.high_threshold_fixed is None:
+                    raise ValueError("Debes indicar --high-threshold-fixed cuando --high-threshold-mode=fixed")
+                high_threshold = float(args.high_threshold_fixed)
+            else:
+                high_threshold = float(pd.Series(y_train).quantile(args.high_threshold_quantile))
+            change_threshold = float(pd.Series(abs_change_train).quantile(args.change_quantile))
+
+            high_mask_val = y_val >= high_threshold
+            change_mask_val = abs_change_val >= change_threshold
+            extra_sw = train_df.get(
+                "sample_weight_incident", pd.Series(1.0, index=train_df.index)
+            ).to_numpy(dtype=float)
+            sw = (
+                1.0
+                + 0.6 * (y_train >= high_threshold).astype(float)
+                + 0.6 * (abs_change_train >= change_threshold).astype(float)
+            ) * extra_sw
+
+            print(
+                f"[MULTIVAL] {res['variant_label']} fold {int(spec['fold'])}/{int(args.calendar_multival_folds)} | "
+                f"train={len(train_df)} | val={len(val_df)} | "
+                f"{val_df.index.min()} -> {val_df.index.max()}"
+            )
+            model = build_hgb_regressor(params, random_state=args.random_state)
+            model.fit(train_df[feature_cols], y_train, sample_weight=sw)
+            pred = np.asarray(model.predict(val_df[feature_cols]), dtype=float).reshape(-1)
+            pred = np.clip(pred, float(np.nanmin(y_train)), float(np.nanmax(y_train)))
+
+            global_metrics, high_metrics, change_metrics, composite_score = evaluate_prediction_set(
+                y_val, pred, high_mask_val, change_mask_val
+            )
+            print(
+                f"[MULTIVAL] -> RMSE={global_metrics['rmse']:.3f} | "
+                f"MAE={global_metrics['mae']:.3f} | bias={global_metrics.get('bias', np.nan):.3f}"
+            )
+            rows.append({
+                "variant_mode": res["variant_mode"],
+                "variant_label": res["variant_label"],
+                "fold": int(spec["fold"]),
+                "train_start": str(train_df.index.min()),
+                "train_end": str(train_df.index.max()),
+                "val_start": str(val_df.index.min()),
+                "val_end": str(val_df.index.max()),
+                "train_rows": int(len(train_df)),
+                "val_rows": int(len(val_df)),
+                "rmse": global_metrics["rmse"],
+                "mae": global_metrics["mae"],
+                "bias": global_metrics.get("bias", np.nan),
+                "r2": global_metrics.get("r2", np.nan),
+                "high_rmse": high_metrics.get("rmse", np.nan),
+                "change_rmse": change_metrics.get("rmse", np.nan),
+                "composite_score": composite_score,
+                "high_threshold": high_threshold,
+                "change_threshold": change_threshold,
+                "params_source": "latest_validation_selected_params",
+                "is_latest_pretest_fold": bool(int(spec["fold"]) == int(args.calendar_multival_folds)),
+            })
+
+    folds_df = pd.DataFrame(rows)
+    if folds_df.empty:
+        raise RuntimeError("No se generaron resultados de validación temporal múltiple")
+
+    folds_df["abs_bias"] = pd.to_numeric(folds_df["bias"], errors="coerce").abs()
+    summary_df = (
+        folds_df.groupby(["variant_mode", "variant_label"], as_index=False)
+        .agg(
+            valid_folds=("fold", "nunique"),
+            rmse_mean=("rmse", "mean"),
+            rmse_median=("rmse", "median"),
+            rmse_std=("rmse", "std"),
+            rmse_worst=("rmse", "max"),
+            mae_mean=("mae", "mean"),
+            abs_bias_mean=("abs_bias", "mean"),
+            composite_mean=("composite_score", "mean"),
+        )
+        .sort_values(["rmse_mean", "rmse_worst"], ascending=[True, True])
+        .reset_index(drop=True)
+    )
+    summary_df["rmse_std"] = summary_df["rmse_std"].fillna(0.0)
+    summary_df["eligible"] = summary_df["valid_folds"] >= int(args.calendar_multival_min_folds)
+
+    meta = {
+        "enabled": True,
+        "selection_uses_test": False,
+        "final_test_start": str(final_test_start),
+        "folds_requested": int(args.calendar_multival_folds),
+        "folds_valid_reference": int(len(valid_specs)),
+        "window_days": float(window_days),
+        "min_valid_folds": int(args.calendar_multival_min_folds),
+        "train_history_days": float(args.train_history_days),
+        "train_history_policy": "all_available_expanding" if args.train_history_days <= 0 else "limited_recent_history",
+        "hyperparameter_policy": (
+            "Cada variante usa los hiperparámetros elegidos en la validación más reciente; "
+            "se reentrena desde cero en cada fold. La multivalidación decide solo la variante de calendario."
+        ),
+        "folds": [
+            {k: v for k, v in spec.items() if k not in {"train_mask", "val_mask"}}
+            for spec in fold_specs
+        ],
+    }
+    return folds_df, summary_df, meta
+
+
+def select_primary_calendar_variant_multitemporal(
+    include_results: List[Dict[str, object]],
+    summary_df: pd.DataFrame,
+    prefer_all_calendar_tolerance: float = 0.05,
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    """Selecciona calendario por RMSE media de varios folds, sin usar test."""
+    eligible = summary_df[summary_df["eligible"]].copy()
+    if eligible.empty:
+        raise RuntimeError("Ninguna variante tiene suficientes folds multitemporales válidos")
+
+    best_row = eligible.sort_values(["rmse_mean", "rmse_worst"], ascending=[True, True]).iloc[0]
+    selected_mode = str(best_row["variant_mode"])
+    reason = "best_multitemporal_mean_rmse"
+    all_row = eligible[eligible["variant_mode"].astype(str).eq("all")]
+    relative_gap_all_vs_best = None
+
+    if not all_row.empty:
+        all_row = all_row.iloc[0]
+        best_rmse = float(best_row["rmse_mean"])
+        all_rmse = float(all_row["rmse_mean"])
+        if best_rmse > 0 and np.isfinite(best_rmse) and np.isfinite(all_rmse):
+            relative_gap_all_vs_best = float((all_rmse - best_rmse) / best_rmse)
+        else:
+            relative_gap_all_vs_best = np.nan
+
+        if str(best_row["variant_mode"]) == "all":
+            selected_mode = "all"
+            reason = "all_calendar_is_best_multitemporal_mean_rmse"
+        elif (
+            relative_gap_all_vs_best is not None
+            and np.isfinite(relative_gap_all_vs_best)
+            and relative_gap_all_vs_best <= float(prefer_all_calendar_tolerance)
+        ):
+            selected_mode = "all"
+            reason = "prefer_all_calendar_within_multitemporal_tolerance"
+
+    matches = [r for r in include_results if str(r.get("variant_mode")) == selected_mode]
+    if not matches:
+        raise RuntimeError(f"No se encuentra resultado operativo para variante seleccionada: {selected_mode}")
+    selected = matches[0]
+
+    selected_summary = eligible[eligible["variant_mode"].astype(str).eq(selected_mode)].iloc[0]
+    meta = {
+        "policy": "v5.8.12_multitemporal_calendar_selection",
+        "selection_uses_test": False,
+        "metric": "mean_global_rmse_across_temporal_folds",
+        "best_by_multitemporal_variant_label": str(best_row["variant_label"]),
+        "best_by_multitemporal_variant_mode": str(best_row["variant_mode"]),
+        "best_by_multitemporal_rmse_mean": float(best_row["rmse_mean"]),
+        "all_calendar_available": bool(not all_row.empty) if isinstance(all_row, pd.DataFrame) else True,
+        "relative_gap_all_calendar_vs_best": relative_gap_all_vs_best,
+        "prefer_all_calendar_tolerance": float(prefer_all_calendar_tolerance),
+        "selected_variant_label": selected.get("variant_label"),
+        "selected_variant_mode": selected.get("variant_mode"),
+        "selected_multitemporal_rmse_mean": float(selected_summary["rmse_mean"]),
+        "selected_multitemporal_rmse_median": float(selected_summary["rmse_median"]),
+        "selected_multitemporal_rmse_worst": float(selected_summary["rmse_worst"]),
+        "selected_multitemporal_valid_folds": int(selected_summary["valid_folds"]),
+        "selection_reason": reason,
+        "note": (
+            "El test final queda completamente fuera de la selección. Se usa la RMSE media de varios folds "
+            "rolling-origin; all_calendar mantiene una tolerancia conservadora por robustez estacional."
+        ),
+    }
+    return selected, meta
+
+
+def load_feature_incident_intervals(args: argparse.Namespace) -> List[Dict[str, object]]:
+    """Carga incidencias confirmadas que invalidan una única feature, no la fila completa."""
+    if not getattr(args, "feature_incident_intervals_csv", None):
+        return []
+
+    path = Path(args.feature_incident_intervals_csv)
+    if not path.exists():
+        raise FileNotFoundError(f"No existe el CSV de incidencias por feature: {path}")
+    try:
+        df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        df = pd.read_csv(path, sep=None, engine="python", encoding="latin1")
+    df.columns = [str(c).strip() for c in df.columns]
+    required = {"start", "end", "feature"}
+    if not required.issubset(df.columns):
+        raise ValueError(
+            f"El CSV de incidencias por feature debe contener start,end,feature. Columnas: {list(df.columns)}"
+        )
+
+    intervals: List[Dict[str, object]] = []
+    for i, row in df.iterrows():
+        start_ts = pd.to_datetime(row.get("start"), errors="coerce", dayfirst=False)
+        end_ts = pd.to_datetime(row.get("end"), errors="coerce", dayfirst=False)
+        feature = str(row.get("feature", "")).strip()
+        sensor_raw = row.get("sensor", "")
+        sensor = "" if pd.isna(sensor_raw) else str(sensor_raw).strip()
+        if pd.isna(start_ts) or pd.isna(end_ts) or not feature:
+            raise ValueError(f"Incidencia por feature {i + 1} no interpretable: {row.to_dict()}")
+        if end_ts < start_ts:
+            raise ValueError(f"Fin anterior al inicio en incidencia por feature {i + 1}: {row.to_dict()}")
+        if sensor and sensor.casefold() != str(args.sensor).strip().casefold():
+            raise ValueError(
+                f"La incidencia por feature {i + 1} corresponde al sensor '{sensor}', "
+                f"pero el entrenamiento usa '{args.sensor}'"
+            )
+        intervals.append({
+            "label": str(row.get("label") or f"feature_incident_{i + 1:03d}"),
+            "sensor": sensor or str(args.sensor),
+            "feature": feature,
+            "start": str(pd.Timestamp(start_ts)),
+            "end": str(pd.Timestamp(end_ts)),
+            "notes": "" if pd.isna(row.get("notes")) else str(row.get("notes", "")),
+            "source": str(path),
+        })
+    return intervals
 
 
 def load_incident_intervals(args: argparse.Namespace) -> List[Dict[str, object]]:
@@ -1823,6 +2400,8 @@ def run_hgb_variant(variant_mode: str,
         feature_clean_ffill_limit=args.feature_clean_ffill_limit,
         min_valid_target=args.min_valid_target,
         max_valid_target=args.max_valid_target,
+        clean_extreme_target_glitches=not args.disable_extreme_target_glitch_cleaning,
+        confirmed_feature_intervals=getattr(args, "feature_incident_intervals", []),
     )
 
     feature_cleaning_meta = dict(model_df.attrs.get("feature_cleaning_meta", {}))
@@ -2124,6 +2703,13 @@ def run_training(args: argparse.Namespace) -> None:
     else:
         calendar_modes = [args.calendar_mode]
 
+    feature_incident_intervals = load_feature_incident_intervals(args)
+    args.feature_incident_intervals = feature_incident_intervals
+    feature_incident_columns = ["label", "sensor", "feature", "start", "end", "notes", "source"]
+    pd.DataFrame(feature_incident_intervals, columns=feature_incident_columns).to_csv(
+        output_dir / "feature_incident_intervals_applied.csv", index=False, encoding="utf-8-sig"
+    )
+
     incident_intervals = load_incident_intervals(args)
     args.incident_intervals = incident_intervals
     incident_defined = bool(incident_intervals)
@@ -2147,7 +2733,7 @@ def run_training(args: argparse.Namespace) -> None:
         ]
 
     print("\n==============================")
-    print("ENTRENAMIENTO THM v5.8.8 SOFT-SENSOR HGB DINÁMICO")
+    print("ENTRENAMIENTO THM v5.8.12 SOFT-SENSOR HGB DINÁMICO")
     print("==============================")
     print(f"Carpeta CSV:            {csv_dir.resolve()}")
     print(f"Carpeta salida:         {output_dir.resolve()}")
@@ -2169,8 +2755,28 @@ def run_training(args: argparse.Namespace) -> None:
     print("Modelo principal:       HGB global")
     print("Modelo operativo:       HGB global")
     print(f"Calendario:             {', '.join(calendar_modes)}")
+    if args.calendar_selection_mode == "multi" and args.split_mode == "dynamic" and len(calendar_modes) > 1:
+        multival_window = args.calendar_multival_window_days if args.calendar_multival_window_days is not None else args.val_window_days
+        print(
+            "Selección calendario:   "
+            f"multitemporal ({args.calendar_multival_folds} folds x {float(multival_window):g} días; "
+            "histórico expansivo; test reservado)"
+        )
+    else:
+        print("Selección calendario:   validación única")
     print(f"Control baseline RMSE:  aviso si HGB no mejora >= {100.0 * args.acceptance_min_rmse_improvement:.2f}% en validación")
     print(f"Control bias/RMSE:      aviso si HGB > {args.acceptance_max_bias_rmse_ratio:.3f}")
+    if feature_incident_intervals:
+        print(f"Incidencias por feature:{len(feature_incident_intervals)}")
+        for interval in feature_incident_intervals:
+            print(
+                "  - "
+                f"{interval['label']}: {interval['feature']} | "
+                f"{interval['start']} -> {interval['end']}"
+            )
+    else:
+        print("Incidencias por feature:0")
+
     if incident_defined:
         print(f"Incidencias confirmadas:{len(incident_intervals)}")
         print(f"Política incidencias:   {args.incident_policy}")
@@ -2259,13 +2865,52 @@ def run_training(args: argparse.Namespace) -> None:
     if not selectable_results:
         raise RuntimeError("No hay escenarios seleccionables tras aplicar la política de incidencias")
 
-    # Selección principal v5.8.8: primero fija el escenario de datos operativo
-    # (exclusión de incidencias confirmadas) y después selecciona la variante de calendario.
-    primary_res, robust_calendar_selection_meta = select_primary_calendar_variant_robust(
-        selectable_results,
-        prefer_all_calendar_tolerance=0.05,
+    # Selección principal: primero fija el escenario de datos operativo y después
+    # selecciona la variante de calendario. En modo multi, el test final queda
+    # completamente reservado y la decisión se basa en varios folds históricos.
+    calendar_multival_folds_df = pd.DataFrame()
+    calendar_multival_summary_df = pd.DataFrame()
+    calendar_multival_meta: Dict[str, object] = {"enabled": False}
+
+    use_multival = (
+        args.calendar_selection_mode == "multi"
+        and args.split_mode == "dynamic"
+        and len(selectable_results) > 1
     )
+    if use_multival:
+        try:
+            calendar_multival_folds_df, calendar_multival_summary_df, calendar_multival_meta = evaluate_calendar_multitemporal(
+                selectable_results=selectable_results,
+                args=args,
+            )
+            primary_res, robust_calendar_selection_meta = select_primary_calendar_variant_multitemporal(
+                include_results=selectable_results,
+                summary_df=calendar_multival_summary_df,
+                prefer_all_calendar_tolerance=float(args.calendar_prefer_all_tolerance),
+            )
+            calendar_multival_folds_df.to_csv(output_dir / "calendar_multival_folds.csv", index=False)
+            calendar_multival_summary_df.to_csv(output_dir / "calendar_multival_summary.csv", index=False)
+        except Exception as exc:
+            calendar_multival_meta = {
+                "enabled": True,
+                "fallback_to_single_validation": True,
+                "fallback_reason": str(exc),
+            }
+            primary_res, robust_calendar_selection_meta = select_primary_calendar_variant_robust(
+                selectable_results,
+                prefer_all_calendar_tolerance=float(args.calendar_prefer_all_tolerance),
+            )
+            robust_calendar_selection_meta["selection_reason"] = (
+                "multitemporal_fallback_to_" + str(robust_calendar_selection_meta.get("selection_reason", "single_validation"))
+            )
+    else:
+        primary_res, robust_calendar_selection_meta = select_primary_calendar_variant_robust(
+            selectable_results,
+            prefer_all_calendar_tolerance=float(args.calendar_prefer_all_tolerance),
+        )
+
     primary_res["robust_calendar_selection_meta"] = robust_calendar_selection_meta
+    primary_res["calendar_multival_meta"] = calendar_multival_meta
 
     print(f"Filas con THM alineado: {primary_res['rows_with_target_after_align']}")
     print(f"Filas sin THM alineado: {primary_res['rows_lost_before_model']}")
@@ -2332,8 +2977,13 @@ def run_training(args: argparse.Namespace) -> None:
     print("\nEscenario principal para artefactos:")
     print(f"  Variante calendario:  {primary_res['variant_label']}")
     if primary_res.get("robust_calendar_selection_meta"):
-        print(f"  Selección calendario: {primary_res['robust_calendar_selection_meta'].get('selection_reason')}")
-        print(f"  Mejor validación:     {primary_res['robust_calendar_selection_meta'].get('best_by_validation_variant_label')}")
+        calendar_selection_meta = primary_res["robust_calendar_selection_meta"]
+        print(f"  Selección calendario: {calendar_selection_meta.get('selection_reason')}")
+        best_multitemporal = calendar_selection_meta.get("best_by_multitemporal_variant_label")
+        if best_multitemporal is not None:
+            print(f"  Mejor multitemporal:  {best_multitemporal}")
+        else:
+            print(f"  Mejor validación:     {calendar_selection_meta.get('best_by_validation_variant_label')}")
     print(f"  Escenario datos:      baseline operativo")
     print(f"  Modelo operativo:     {primary_res['selected_model_type']}")
     print(f"  Estado validación:    {primary_res['acceptance']['hgb_validation_status']}")
@@ -2347,6 +2997,7 @@ def run_training(args: argparse.Namespace) -> None:
     target_invalid_value_only = max(0, target_invalid_total - int(primary_res.get('rows_lost_before_model', 0) or 0))
     print(f"THM anómalos descartados: {target_invalid_value_only}")
     print(f"Valores X limpiados:    {primary_res.get('feature_cleaning_meta', {}).get('total_values_cleaned', 0)}")
+    print(f"X por incidencia feature:{primary_res.get('feature_cleaning_meta', {}).get('confirmed_feature_incident_values_cleaned', 0)}")
     print(f"Filas X centinela limpiadas: {primary_res.get('feature_cleaning_meta', {}).get('row_sentinel_rows_cleaned', 0)}")
     sentinel_ts = primary_res.get('feature_cleaning_meta', {}).get('row_sentinel_timestamps', [])
     if sentinel_ts:
@@ -2521,8 +3172,11 @@ def run_training(args: argparse.Namespace) -> None:
         "feature_cleaning_enabled": not args.disable_feature_cleaning,
         "feature_cleaning_meta": primary_res.get("feature_cleaning_meta", {}),
         "target_cleaning_meta": primary_res.get("target_cleaning_meta", {}),
+        "extreme_target_glitch_cleaning_enabled": not args.disable_extreme_target_glitch_cleaning,
         "calendar_mode_selected": primary_res["variant_mode"],
         "robust_calendar_selection_meta": primary_res.get("robust_calendar_selection_meta", {}),
+        "calendar_multival_meta": primary_res.get("calendar_multival_meta", {}),
+        "calendar_selection_mode": args.calendar_selection_mode,
         "calendar_mode_requested": args.calendar_mode,
         "calendar_modes_compared": calendar_modes,
         "split_mode_requested": args.split_mode,
@@ -2530,12 +3184,13 @@ def run_training(args: argparse.Namespace) -> None:
         "val_window_days": float(args.val_window_days),
         "test_window_days": float(args.test_window_days),
         "train_history_days": float(args.train_history_days),
+        "feature_incident_intervals_csv": args.feature_incident_intervals_csv,
+        "feature_incident_intervals": feature_incident_intervals,
         "incident_policy": args.incident_policy,
         "incident_intervals_csv": args.incident_intervals_csv,
         "incident_intervals": incident_intervals,
         "data_scenarios_compared": [s["label"] for s in incident_scenarios],
         "primary_data_scenario": primary_res["incident_strategy"],
-        "incident_intervals": incident_intervals,
         "change_lookback_minutes": int(args.change_lookback),
         "high_threshold_mode": args.high_threshold_mode,
         "high_threshold_train_quantile": float(pd.Series(primary_res["train_df"][TARGET_COL]).quantile(args.high_threshold_quantile)),
@@ -2564,6 +3219,8 @@ def run_training(args: argparse.Namespace) -> None:
         "hgb_model_feature_cols": primary_res["model_feature_cols"],
         "calendar_mode": primary_res["variant_mode"],
         "robust_calendar_selection_meta": primary_res.get("robust_calendar_selection_meta", {}),
+        "calendar_multival_meta": primary_res.get("calendar_multival_meta", {}),
+        "calendar_selection_mode": args.calendar_selection_mode,
         "calendar_modes_compared": calendar_modes,
         "split_mode_requested": args.split_mode,
         "split_meta": primary_res.get("split_meta", {}),
@@ -2573,6 +3230,7 @@ def run_training(args: argparse.Namespace) -> None:
         "feature_cleaning_enabled": not args.disable_feature_cleaning,
         "feature_cleaning_meta": primary_res.get("feature_cleaning_meta", {}),
         "target_cleaning_meta": primary_res.get("target_cleaning_meta", {}),
+        "extreme_target_glitch_cleaning_enabled": not args.disable_extreme_target_glitch_cleaning,
         # Compatibilidad: global_model apunta al HGB operativo.
         "global_model": primary_res["selected_model"],
         "selected_model": primary_res["selected_model"],
@@ -2639,6 +3297,7 @@ def run_training(args: argparse.Namespace) -> None:
         data_quality_summary_df,
         data_quality_feature_df,
         data_quality_target_anomalies_df,
+        data_quality_feature_physical_anomalies_df,
         data_quality_x_sentinel_df,
     ) = build_data_quality_report(primary_res)
     (output_dir / "data_quality_report.json").write_text(
@@ -2648,6 +3307,16 @@ def run_training(args: argparse.Namespace) -> None:
     data_quality_summary_df.to_csv(output_dir / "data_quality_summary.csv", index=False)
     data_quality_feature_df.to_csv(output_dir / "data_quality_feature_cleaning.csv", index=False)
     data_quality_target_anomalies_df.to_csv(output_dir / "data_quality_target_anomalies.csv", index=False)
+    data_quality_feature_physical_anomalies_df.to_csv(
+        output_dir / "data_quality_feature_physical_anomalies.csv", index=False
+    )
+    confirmed_feature_records = list(
+        primary_res.get("feature_cleaning_meta", {}).get("confirmed_feature_incident_records", []) or []
+    )
+    pd.DataFrame(
+        confirmed_feature_records,
+        columns=["timestamp", "feature", "value", "label", "start", "end", "notes", "source"],
+    ).to_csv(output_dir / "data_quality_feature_incident_values.csv", index=False)
     data_quality_x_sentinel_df.to_csv(output_dir / "data_quality_x_sentinel_rows.csv", index=False)
 
     metadata = {
@@ -2663,11 +3332,18 @@ def run_training(args: argparse.Namespace) -> None:
         "calendar_mode_requested": args.calendar_mode,
         "calendar_modes_compared": calendar_modes,
         "calendar_mode_selected": primary_res["variant_mode"],
+        "calendar_selection_mode": args.calendar_selection_mode,
+        "calendar_prefer_all_tolerance": float(args.calendar_prefer_all_tolerance),
+        "robust_calendar_selection_meta": primary_res.get("robust_calendar_selection_meta", {}),
+        "calendar_multival_meta": primary_res.get("calendar_multival_meta", {}),
+        "calendar_multival_summary": calendar_multival_summary_df.to_dict(orient="records") if not calendar_multival_summary_df.empty else [],
         "split_mode_requested": args.split_mode,
         "split_meta": primary_res.get("split_meta", {}),
         "val_window_days": float(args.val_window_days),
         "test_window_days": float(args.test_window_days),
         "train_history_days": float(args.train_history_days),
+        "feature_incident_intervals_csv": args.feature_incident_intervals_csv,
+        "feature_incident_intervals": feature_incident_intervals,
         "incident_policy": args.incident_policy,
         "incident_intervals_csv": args.incident_intervals_csv,
         "incident_intervals": incident_intervals,
@@ -2710,6 +3386,8 @@ def run_training(args: argparse.Namespace) -> None:
         "scenario_model_acceptance_comparison.csv",
         "scenario_comparison.csv",
         "model_selection_results.csv",
+        "calendar_multival_folds.csv",
+        "calendar_multival_summary.csv",
         "feature_importance_permutation.csv",
         "feature_importance_aggregated.csv",
         "split_target_distribution.csv",
@@ -2728,6 +3406,8 @@ def run_training(args: argparse.Namespace) -> None:
         "data_quality_summary.csv",
         "data_quality_feature_cleaning.csv",
         "data_quality_target_anomalies.csv",
+        "data_quality_feature_physical_anomalies.csv",
+        "data_quality_feature_incident_values.csv",
         "data_quality_x_sentinel_rows.csv",
         "metadata.json",
     ]:
@@ -2749,11 +3429,13 @@ def print_compact_training_summary(args: argparse.Namespace, verbose_log_path: P
     output_dir = Path(args.output_dir)
     metadata_path = output_dir / "metadata.json"
     scenario_path = output_dir / "scenario_comparison.csv"
+    multival_path = output_dir / "calendar_multival_summary.csv"
     quality_path = output_dir / "data_quality_report.json"
 
     metadata: Dict[str, object] = {}
     quality: Dict[str, object] = {}
     scenario_df = pd.DataFrame()
+    multival_df = pd.DataFrame()
 
     if metadata_path.exists():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -2761,6 +3443,8 @@ def print_compact_training_summary(args: argparse.Namespace, verbose_log_path: P
         quality = json.loads(quality_path.read_text(encoding="utf-8"))
     if scenario_path.exists():
         scenario_df = pd.read_csv(scenario_path)
+    if multival_path.exists():
+        multival_df = pd.read_csv(multival_path)
 
     split_meta = metadata.get("split_meta", {}) if isinstance(metadata, dict) else {}
     acceptance = metadata.get("acceptance", {}) if isinstance(metadata, dict) else {}
@@ -2777,7 +3461,7 @@ def print_compact_training_summary(args: argparse.Namespace, verbose_log_path: P
     dummy_metrics = metadata.get("primary_metrics_test_dummy", {})
 
     print("\n========================================")
-    print("THM v5.8.8 | RESUMEN DE ENTRENAMIENTO")
+    print("THM v5.8.12 | RESUMEN DE ENTRENAMIENTO")
     print("========================================")
     print(f"Estado:              {acceptance.get('hgb_validation_status', 'n/a')}")
     print(f"Modelo seleccionado: {selected_model} / {selected_variant}")
@@ -2822,6 +3506,19 @@ def print_compact_training_summary(args: argparse.Namespace, verbose_log_path: P
     print(f"  Val:   {split_meta.get('val_start', 'n/a')} -> {split_meta.get('val_end', 'n/a')} ({split_meta.get('val_rows', 'n/a')} filas)")
     print(f"  Test:  {split_meta.get('test_start', 'n/a')} -> {split_meta.get('test_end', 'n/a')} ({split_meta.get('test_rows', 'n/a')} filas)")
 
+    if not multival_df.empty:
+        print("\nValidación temporal múltiple del calendario")
+        print("  variante             folds   RMSE mean   RMSE med   RMSE worst   |bias| mean")
+        for _, row in multival_df.sort_values("rmse_mean").iterrows():
+            print(
+                f"  {str(row.get('variant_label', 'n/a')):<20} "
+                f"{int(row.get('valid_folds', 0)):>5}   "
+                f"{_fmt_metric(row.get('rmse_mean')):>9}   "
+                f"{_fmt_metric(row.get('rmse_median')):>8}   "
+                f"{_fmt_metric(row.get('rmse_worst')):>10}   "
+                f"{_fmt_metric(row.get('abs_bias_mean')):>11}"
+            )
+
     if not scenario_df.empty:
         preferred_scenario = metadata.get("primary_data_scenario", "include") if isinstance(metadata, dict) else "include"
         baseline = scenario_df[scenario_df["data_scenario"] == preferred_scenario].copy()
@@ -2863,7 +3560,9 @@ def print_compact_training_summary(args: argparse.Namespace, verbose_log_path: P
     feature_quality = quality.get("feature_cleaning", {}) if isinstance(quality, dict) else {}
     print("\nCalidad de datos")
     print(f"  THM anómalos:        {target_quality.get('rows_invalid_due_to_value_rules', 'consultar CSV')}")
+    print(f"  THM glitches extremos: {metadata.get('data_quality_report', {}).get('target_cleaning', {}).get('rows_invalid_extreme_glitch', target_quality.get('rows_invalid_extreme_glitch', 'consultar CSV')) if isinstance(metadata, dict) else 'consultar CSV'}")
     print(f"  Valores X limpiados: {feature_quality.get('total_values_cleaned', 'consultar CSV')}")
+    print(f"  X fuera de rango:    {feature_quality.get('physical_anomaly_values', 'consultar CSV')}")
     print(f"  Filas centinela X:   {feature_quality.get('row_sentinel_rows_cleaned', 'consultar CSV')}")
 
     importance_path = output_dir / "feature_importance_aggregated.csv"
@@ -2881,7 +3580,9 @@ def print_compact_training_summary(args: argparse.Namespace, verbose_log_path: P
         "test_predictions.csv",
         "scenario_comparison.csv",
         "data_quality_target_anomalies.csv",
+        "data_quality_feature_physical_anomalies.csv",
         "incident_intervals_applied.csv",
+        "feature_incident_intervals_applied.csv",
         "metadata.json",
     ]:
         path = output_dir / name
@@ -2902,7 +3603,7 @@ def main() -> None:
     verbose_log_path = output_dir / "training_verbose.log"
     buffer = io.StringIO()
 
-    print("Iniciando entrenamiento THM v5.8.8...")
+    print("Iniciando entrenamiento THM v5.8.12...")
     print(f"Entrada: {Path(args.csv_dir).resolve()}")
     print(f"Salida:  {output_dir.resolve()}")
     print("El detalle completo se guardará en training_verbose.log.")

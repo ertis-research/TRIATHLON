@@ -40,17 +40,19 @@ TIME_PATTERNS = [
 
 
 THM_TOTAL_PATTERNS = [
-    # Formato real:
+    # Formato sin incertidumbre:
     # Suma de Trihalometanos PE-COR-025 100 30.6 µg/L
-    r"Suma\s+de\s+Trihalometanos\s+.*?\s(\d+(?:[,.]\d+)?)\s*(?:µg/L|ug/L|microg/L)",
+    # Formato con incertidumbre:
+    # Suma de Trihalometanos PE-COR-025 100 43.6 ± 27 % µg/L
+    r"Suma\s+de\s+Trihalometanos\s+.*?\s(\d+(?:[,.]\d+)?)\s*(?:(?:±|\+/-|\+-)\s*\d+(?:[,.]\d+)?\s*%\s*)?(?:µg/L|ug/L|microg/L)",
 
     # Variante posible:
-    # Trihalometanos totales ... 30.6 µg/L
-    r"Trihalometanos\s+totales\s+.*?\s(\d+(?:[,.]\d+)?)\s*(?:µg/L|ug/L|microg/L)",
+    # Trihalometanos totales ... 30.6 [± 27 %] µg/L
+    r"Trihalometanos\s+totales\s+.*?\s(\d+(?:[,.]\d+)?)\s*(?:(?:±|\+/-|\+-)\s*\d+(?:[,.]\d+)?\s*%\s*)?(?:µg/L|ug/L|microg/L)",
 
     # Variante defensiva:
-    # THM totales ... 30.6 µg/L
-    r"\bTHM(?:s)?\s+totales\s+.*?\s(\d+(?:[,.]\d+)?)\s*(?:µg/L|ug/L|microg/L)",
+    # THM totales ... 30.6 [± 27 %] µg/L
+    r"\bTHM(?:s)?\s+totales\s+.*?\s(\d+(?:[,.]\d+)?)\s*(?:(?:±|\+/-|\+-)\s*\d+(?:[,.]\d+)?\s*%\s*)?(?:µg/L|ug/L|microg/L)",
 ]
 
 

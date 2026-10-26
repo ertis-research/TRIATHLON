@@ -19,22 +19,36 @@ El modelo se construye con:
 
 Los ficheros `fp` quedan excluidos por confirmacion de planta.
 
-El Excel `CLORIMETROS+CAUDALIMETROS.xlsx` queda fuera del pipeline hasta que planta confirme el mapeo de puntos, las unidades, el significado de las senales y posibles duplicidades con los datos SFTP.
+El Excel `CLORIMETROS+CAUDALIMETROS.xlsx` permanece fuera del pipeline hasta que planta confirme el mapeo de puntos, las unidades, el significado de las senales y posibles duplicidades con los datos SFTP.
+
+Antes de iniciar una nueva validacion formal, consultar `CURRENT_STABLE.md`.
 
 ---
 
-## 2. Estructura principal
+## 2. Estructura principal activa
 
 ```text
 Huelva/
 +-- THM_Depositos/
 +-- huelva_outputs_v0_2_thm_pdf/
++-- huelva_outputs_v0_3_72h_thm_pdf/
 +-- huelva_multiparam_sftp/
-|   +-- logs/
-|   +-- raw_downloads_window_matched/
-|   +-- selected_inspection_v0_1_clean/
 +-- huelva_par_etl_outputs_v0_1/
-+-- model_outputs_huelva_thm_softsensor_v0_2/
++-- model_outputs_huelva_thm_softsensor_v0_4_formal/
++-- experiments/
+|   +-- no_color_v0_5/
+|       +-- train_huelva_thm_softsensor_v0_5_no_color.py
+|       +-- README.md
+|       +-- outputs/
++-- huesna_transfer/
+|   +-- README.md
+|   +-- evaluate_huesna_huelva_zero_shot_formal_v1_0.py
+|   +-- evaluate_huesna_huelva_fixed_holdout_formal_v1_0.py
+|   +-- results/
+|   +-- outputs/
++-- Validation/
+|   +-- Validacion_Huelva_octubre_2026.docx
+|   +-- Validacion_Huelva_octubre_2026.pdf
 +-- archive/
 +-- config_private.py
 +-- config_private.example.py
@@ -42,37 +56,42 @@ Huelva/
 +-- download_huelva_multiparam_sftp_v0_15_selective_cached.py
 +-- inspect_huelva_selected_multiparam_v0_1.py
 +-- build_huelva_par_feature_dataset_v0_1.py
-+-- train_huelva_thm_softsensor_v0_2.py
++-- train_huelva_thm_softsensor_v0_4_formal.py
++-- CURRENT_STABLE.md
 +-- workflow.md
 ```
 
 `config_private.py` contiene la password SFTP local y debe permanecer ignorado por Git. `config_private.example.py` es la plantilla publica que se versiona.
 
+Los datos brutos, outputs de entrenamiento, outputs regenerables y `archive/` permanecen fuera de Git mediante `.gitignore`.
+
+Los experimentos complementarios se organizan en `experiments/`. Sus scripts y documentos de referencia se versionan, mientras que `outputs/` contiene resultados regenerables ignorados por Git.
+
+La carpeta `huesna_transfer/results/` contiene unicamente resultados simplificados y consolidados que interesa versionar. `huesna_transfer/outputs/` contiene salidas regenerables y se ignora.
+
 ---
 
 ## 3. Regla de actualizacion
 
-El flujo debe ejecutarse de forma event-driven, no necesariamente cada dia.
+El flujo se ejecuta de forma event-driven.
 
-### Ejecutar el flujo completo cuando
+Ejecutar el flujo cuando:
 
-- se anade un PDF de laboratorio;
+- se anade un nuevo PDF de laboratorio;
 - una muestra pasa a disponer de fecha y hora exactas;
 - se corrige una muestra THM;
 - cambia el esquema de los CSV `par`;
-- se desea reconstruir o reentrenar el modelo.
+- se desea iniciar una nueva validacion formal.
 
-### No es necesario consultar el SFTP cuando
-
-- no existen nuevas muestras THM exactas;
-- solo han aparecido nuevos CSV multiparametricos posteriores a la ultima muestra;
-- el dataset supervisado sigue sin cambios.
+No es necesario reconstruir el conjunto supervisado cuando solo aparecen nuevos CSV multiparametricos posteriores a la ultima muestra THM exacta.
 
 En Huelva, nuevos CSV sin nuevos targets THM no anaden ejemplos supervisados.
 
 ---
 
 ## 4. Paso 1 - extraccion de THM desde PDF
+
+Ventanas de 24 horas para el ETL actual:
 
 ```powershell
 python .\extract_huelva_thm_pdfs_v0_2.py `
@@ -81,7 +100,7 @@ python .\extract_huelva_thm_pdfs_v0_2.py `
   --history-hours 24
 ```
 
-Comprobar en consola:
+Comprobar:
 
 ```text
 PDFs encontrados
@@ -90,118 +109,61 @@ Candidatas solo con fecha
 Revisar/errores
 ```
 
-Salidas principales:
+Solo las muestras con fecha y hora exactas pasan al conjunto supervisado.
+
+Referencia formal 01/10/2026:
 
 ```text
-huelva_outputs_v0_2_thm_pdf\
-+-- huelva_thm_exact_datetime_samples_v0_2.csv
-+-- huelva_required_multiparametric_windows_exact_v0_2.csv
-+-- huelva_thm_date_only_candidates_v0_2.csv
-+-- huelva_thm_review_pdfs_v0_2.csv
-+-- huelva_thm_pdf_extraction_all_v0_2.csv
-+-- huelva_thm_pdf_extraction_report_v0_2.xlsx
+PDFs encontrados:               75
+Muestras THM exactas:           34
+Candidatas solo con fecha:      40
+Revisar/errores:                 1
 ```
 
-Solo las muestras con fecha y hora exactas pasan al entrenamiento.
+El PDF revisado del 23/10/2025 08:15 no contiene un resultado THM y permanece excluido.
 
 ---
 
-## 5. Paso 2 - seleccion y descarga de CSV par
+## 5. Paso 2 - ventanas ampliadas para descarga SFTP
 
-El downloader obtiene la password en este orden:
-
-1. variable de entorno `HUELVA_SFTP_PASSWORD`;
-2. fichero local `config_private.py`;
-3. entrada interactiva, solo si se activa en el script.
-
-Ejecucion normal:
+Para disponer de historico suficiente para las features multiescala hasta 72 horas:
 
 ```powershell
-python .\download_huelva_multiparam_sftp_v0_15_selective_cached.py `
-  --mode download-window
+python .\extract_huelva_thm_pdfs_v0_2.py `
+  --pdf-root ".\THM_Depositos" `
+  --output-dir ".\huelva_outputs_v0_3_72h_thm_pdf" `
+  --history-hours 72
 ```
 
-`par` es el tipo incluido por defecto. Tambien puede indicarse de forma explicita:
+Estas ventanas de 72 horas se utilizan para descargar los datos necesarios.
+
+No deben utilizarse directamente como entrada del ETL actual para las features denominadas `24h`.
+
+---
+
+## 6. Paso 3 - descarga incremental de CSV `par`
 
 ```powershell
 python .\download_huelva_multiparam_sftp_v0_15_selective_cached.py `
   --mode download-window `
+  --windows-csv ".\huelva_outputs_v0_3_72h_thm_pdf\huelva_required_multiparametric_windows_exact_v0_2.csv" `
   --include-kinds par
 ```
 
-El script:
-
-1. carga las ventanas THM;
-2. lista los ficheros `par` del SFTP;
-3. reutiliza el indice local para ficheros ya conocidos;
-4. inspecciona los nuevos o modificados;
-5. detecta solape temporal con las ventanas THM;
-6. descarga unicamente los ficheros necesarios.
-
-Salidas principales:
+Referencia formal 01/10/2026:
 
 ```text
-huelva_multiparam_sftp\logs\
-+-- huelva_sftp_remote_csv_index_v0_15.csv
-+-- huelva_sftp_remote_selected_v0_15.csv
-+-- huelva_sftp_selective_download_manifest_v0_15.csv
-+-- huelva_sftp_selective_runtime_config_v0_15.json
-+-- paramiko_huelva_sftp_selective_v0_15.log
-```
-
-CSV descargados:
-
-```text
-huelva_multiparam_sftp\raw_downloads_window_matched
-```
-
-El JSON de runtime no guarda la password real: la sustituye por `***`.
-
-### Nota de eficiencia
-
-La version v0.15 es correcta y auditable, pero el SFTP plano sigue acumulando miles de ficheros.
-
-La mejora futura recomendada es un selector en dos niveles:
-
-1. prefiltro por nombre y metadatos, aprovechando timestamps como `_YYMMDD_HHMMSS_par.csv`;
-2. verificacion de timestamps internos solo para candidatos proximos a las ventanas THM o con nombre ambiguo.
-
----
-
-## 6. Paso 3 - inspeccion de estructura par
-
-Este paso es opcional. No necesita ejecutarse en cada actualizacion.
-
-Ejecutarlo cuando aparezcan nuevos esquemas o cambien sensores o columnas:
-
-```powershell
-python .\inspect_huelva_selected_multiparam_v0_1.py `
-  --manifest-csv ".\huelva_multiparam_sftp\logs\huelva_sftp_selective_download_manifest_v0_15.csv" `
-  --output-dir ".\huelva_multiparam_sftp\selected_inspection_v0_1_clean"
-```
-
-Comprobar:
-
-```text
-Ficheros en manifest
-Ficheros locales existentes
-Resumen por tipo par
-read_ok igual a True
+Ficheros par representados: 20.045
+Errores de descarga:         0
 ```
 
 ---
 
-## 7. Paso 4 - construccion del dataset de features
+## 7. Paso 4 - construccion del dataset multiparametrico
 
-Ejecucion normal:
+El ETL actual utiliza literalmente `download_start_dt` y `download_end_dt` para las features que denomina `24h`.
 
-```powershell
-python .\build_huelva_par_feature_dataset_v0_1.py
-```
-
-El manifest y el CSV de ventanas ya tienen rutas por defecto coherentes con el pipeline actual.
-
-Ejecucion explicita equivalente:
+Por este motivo debe recibir el CSV original de ventanas de 24 horas:
 
 ```powershell
 python .\build_huelva_par_feature_dataset_v0_1.py `
@@ -209,17 +171,15 @@ python .\build_huelva_par_feature_dataset_v0_1.py `
   --windows-csv ".\huelva_outputs_v0_2_thm_pdf\huelva_required_multiparametric_windows_exact_v0_2.csv"
 ```
 
-Decisiones aplicadas:
+Decisiones activas:
 
 - solo `par`;
 - `fp` excluido;
-- nombres naturales;
 - valor corregido valido como principal;
 - valor medido valido como fallback;
-- valores marcados explicitamente como no validos excluidos de la senal final;
-- medido, corregido y status conservados para auditoria;
+- estado original conservado para auditoria;
 - `spec_*` desactivado por defecto;
-- indicadores diagnosticos `ana::tool` desactivados por defecto.
+- indicadores `ana::tool` desactivados por defecto.
 
 Variables principales:
 
@@ -236,169 +196,212 @@ color_hazen
 flow
 ```
 
-Salidas:
+Referencia formal:
 
 ```text
-huelva_par_etl_outputs_v0_1\
-+-- huelva_par_timeseries_raw_wide_v0_1.csv
-+-- huelva_par_timeseries_clean_v0_1.csv
-+-- huelva_thm_par_feature_dataset_v0_1.csv
-+-- huelva_thm_par_window_coverage_v0_1.csv
-+-- huelva_par_column_mapping_v0_1.csv
-+-- huelva_par_read_issues_v0_1.csv
-+-- huelva_par_etl_report_v0_1.md
-+-- huelva_par_etl_report_v0_1.xlsx
+Ficheros par leidos correctamente: 20.045 / 20.045
+Filas multiparametricas:           205.641
+Timestamps unicos limpios:         205.641
+Cobertura media por variable:      0,998
 ```
 
-Comprobar especialmente:
-
-```text
-Ficheros par leidos OK
-Muestras THM exactas
-Timestamps unicos limpios
-Cobertura media por variable
-```
+La serie limpia completa permite que el entrenamiento formal reconstruya de forma independiente ventanas de 6, 12, 24, 48 y 72 horas.
 
 ---
 
-## 8. Paso 5 - entrenamiento del soft-sensor
+## 8. Paso 5 - validacion formal local
+
+Script activo:
 
 ```powershell
-python .\train_huelva_thm_softsensor_v0_2.py
+python .\train_huelva_thm_softsensor_v0_4_formal.py
 ```
 
-La version v0.2:
+Protocolo:
 
-1. ordena las muestras temporalmente;
-2. reserva las ultimas cinco muestras como test final aislado;
-3. usa las primeras 21 muestras como desarrollo;
-4. ejecuta walk-forward expanding-window sobre desarrollo;
-5. compara Dummy, Ridge y HGB;
-6. selecciona cada familia usando RMSE, MAE y bias del walk-forward;
-7. evalua una vez las familias seleccionadas en el test final;
-8. mantiene HGB como familia principal del proyecto;
-9. guarda por separado los modelos de evaluacion y los reentrenados con todos los datos.
+- `test = max(5, ceil(20% de N))`;
+- split estrictamente temporal;
+- test final completamente aislado;
+- walk-forward expansivo solo dentro de desarrollo;
+- comparacion de Dummy, Ridge y HGB;
+- grupos `baseline_24h`, `multiscale_means` y `compact_level_trend`;
+- seleccion global por RMSE, MAE y valor absoluto del bias;
+- el test no modifica la seleccion.
 
-Features actuales:
+Referencia 01/10/2026:
 
 ```text
-medias de 24 horas de las 10 variables principales
+Muestras exactas: 34
+Desarrollo:       27
+Test final:        7
 ```
 
-`sample_point` no se utiliza como feature. En el dataset actual todos los targets corresponden al mismo punto de muestra.
-
-Salidas principales:
+Modelo seleccionado:
 
 ```text
-model_outputs_huelva_thm_softsensor_v0_2\
-+-- feature_inventory.csv
-+-- walk_forward_candidate_metrics.csv
-+-- walk_forward_predictions_all.csv
-+-- walk_forward_feature_filter_audit.csv
-+-- final_test_metrics.csv
-+-- final_test_predictions_all.csv
-+-- final_test_feature_filter_audit.csv
-+-- feature_target_correlations_development.csv
-+-- primary_hgb_permutation_importance_test_exploratory.csv
-+-- primary_hgb_evaluation_bundle.joblib
-+-- primary_hgb_full_data_bundle.joblib
-+-- best_overall_evaluation_bundle.joblib
-+-- best_overall_full_data_bundle.joblib
-+-- metadata.json
-+-- final_test_predictions_vs_real.png
-+-- primary_hgb_walk_forward_predictions_vs_real.png
-+-- training_report_v0_2.md
-+-- training_report_v0_2.xlsx
+ridge_baseline_24h_alpha_10
 ```
 
-Con 26 muestras, los resultados deben considerarse exploratorios.
+Walk-forward de desarrollo:
 
-El baseline actual muestra que HGB no supera al Dummy en el test final. Esto no invalida el pipeline, pero indica que aun no existe una senal predictiva temporal suficientemente estable con la representacion actual.
+```text
+MAE  = 3,7698 ug/L
+RMSE = 4,6268 ug/L
+Bias = -1,2134 ug/L
+```
 
----
+Test final 7/7:
 
-## 9. Flujo completo
+```text
+MAE  = 11,6500 ug/L
+RMSE = 18,2223 ug/L
+Bias = +0,4941 ug/L
+```
 
-Cuando exista una nueva muestra THM exacta:
+La degradacion del test se asocia a un fuerte cambio de dominio en las variables de entrada, especialmente color, UV254, TOC y DOC. La muestra del 16/09/2026 produce una extrapolacion extrema del Ridge y no debe eliminarse ni utilizarse para volver a seleccionar el modelo.
+
+Esta ejecucion queda congelada como primera referencia formal de Huelva.
+
+### 8.1. Experimento complementario sin la variable color
+
+Se repitio el protocolo de la validacion v0.4 excluyendo exclusivamente `color_hazen` de las entradas del modelo. Se conservaron las 34 muestras, el split 27/7, los 23 candidatos y el criterio de seleccion original.
+
+Script:
 
 ```powershell
-python .\extract_huelva_thm_pdfs_v0_2.py `
-  --pdf-root ".\THM_Depositos" `
-  --output-dir ".\huelva_outputs_v0_2_thm_pdf" `
-  --history-hours 24
-
-python .\download_huelva_multiparam_sftp_v0_15_selective_cached.py `
-  --mode download-window
-
-python .\build_huelva_par_feature_dataset_v0_1.py
-
-python .\train_huelva_thm_softsensor_v0_2.py
+python .\experiments\no_color_v0_5\train_huelva_thm_softsensor_v0_5_no_color.py
 ```
 
-El inspector se mantiene como paso opcional de auditoria.
+El modelo seleccionado sigue siendo `ridge_baseline_24h_alpha_10`.
+
+| Metrica test Ridge | v0.4 con color | v0.5 sin color |
+|---|---:|---:|
+| MAE (ug/L) | 11,650 | 11,701 |
+| RMSE (ug/L) | 18,222 | 14,344 |
+| Bias (ug/L) | +0,494 | -4,417 |
+
+La mejora del RMSE se concentra principalmente en la muestra del 16/09. Sin embargo, las restantes predicciones empeoran en conjunto y el modelo presenta mayor tendencia a infraestimar.
+
+El HGB seleccionado dentro de su familia obtiene RMSE = 12,010 ug/L en el test de v0.5, pero no sustituye al Ridge, ya que la seleccion global se realizo exclusivamente en desarrollo.
+
+Esta prueba es exploratoria y complementaria: no modifica la seleccion ni la referencia formal v0.4. El detalle se conserva en `experiments/no_color_v0_5/README.md` y en el anexo de `Validation/`.
 
 ---
 
-## 10. Estado de referencia actual
+## 9. Transferencia formal Huesna -> Huelva
 
-```text
-PDFs encontrados:             62
-Muestras THM exactas:         26
-CSV par seleccionados:        47
-CSV par leidos correctamente: 47/47
-Filas multiparametricas:      174871
-Timestamps unicos limpios:    174871
-Cobertura media variables:    0.997
+La transferencia es un analisis complementario y no participa en la seleccion del modelo local.
+
+Los scripts activos se mantienen separados en `huesna_transfer/`:
+
+```powershell
+python .\huesna_transfer\evaluate_huesna_huelva_zero_shot_formal_v1_0.py
+python .\huesna_transfer\evaluate_huesna_huelva_fixed_holdout_formal_v1_0.py
 ```
 
-Split temporal del modelo v0.2:
+Modelo fuente:
 
 ```text
-Desarrollo: 21 muestras
-Test final: 5 muestras
-Predicciones walk-forward por candidato: 11
+Huesna v5.8.12
+model_outputs_thm_softsensor_v5_8_12_incidents_20260921_135541
 ```
 
-Resultado de referencia del test final:
+Zero-shot global:
 
 ```text
-Dummy mediana:
-MAE  = 2.6200
-RMSE = 3.6581
-
-HGB principal:
-MAE  = 4.6250
-RMSE = 5.5664
-
-Ridge seleccionado:
-MAE  = 7.4389
-RMSE = 7.9590
+Cobertura = 33/34 = 97,1 %
+MAE       = 14,9676 ug/L
+RMSE      = 16,9732 ug/L
+Bias      = -14,7683 ug/L
+Pearson   = 0,5563
 ```
+
+Holdout equivalente:
+
+```text
+Desarrollo/calibracion Huesna: 27/27
+Test Huesna:                   6/7
+```
+
+Mejor adaptacion observada: correccion fija de bias.
+
+```text
+MAE  = 8,2852 ug/L
+RMSE = 9,3319 ug/L
+Bias = -1,9266 ug/L
+```
+
+Comparacion sobre las seis muestras comunes:
+
+```text
+Ridge local:
+MAE  = 6,6182
+RMSE = 9,7783
+
+Huesna + bias fijo:
+MAE  = 8,2852
+RMSE = 9,3319
+```
+
+Con seis muestras no existe evidencia suficiente para declarar una ventaja estable de una alternativa sobre la otra. El estudio anterior de transferencia tampoco mostro una superioridad consistente del modelo transferido frente al modelo lineal local.
+
+La muestra del 16/09/2026 queda sin prediccion Huesna porque el pipeline fuente actual mantiene una guarda tecnica sobre UVAS introducida para limpieza de glitches.
+
+Pendiente de confirmar con planta para futuras versiones de Huesna:
+
+```text
+hard-invalid -> no predecir
+OOD plausible -> predecir + warning
+in-domain -> prediccion normal
+```
+
+La validacion formal actual reproduce el contrato Huesna vigente y no aplica retrospectivamente esta posible mejora.
 
 ---
 
-## 11. Siguiente evolucion prevista
+## 10. Diagnostico y estado actual
 
-La siguiente version debe centrarse en la representacion temporal, no en aumentar la complejidad del modelo.
+El diagnostico de deriva forma parte de la validacion formal y no debe utilizarse para modificar retrospectivamente el split o la seleccion.
 
-Trabajo previsto:
+Variables con mayor desplazamiento entre desarrollo y test:
 
 ```text
-ETL multiventana
-+-- 6 h
-+-- 12 h
-+-- 24 h
-+-- 48 h
-+-- 72 h
-
-Entrenamiento v0.3
-+-- Dummy
-+-- Ridge
-+-- HGB regularizado
-+-- grupos compactos de variables
-+-- seleccion walk-forward
-+-- test final aislado
-+-- diagnostico de deriva entre desarrollo y test
+Color
+UV254
+TOC
+DOC
+Temperatura
 ```
 
-El objetivo es comprobar si existe senal predictiva con otra ventana temporal o si las variables disponibles no son suficientes con el numero actual de muestras.
+En la muestra del 16/09/2026:
+
+```text
+THM real:         45,1 ug/L
+Prediccion Ridge: 86,94 ug/L
+Error:            +41,84 ug/L
+```
+
+Posteriormente, planta confirmo que el 15/09/2026 se agoto el aporte de agua procedente del pantano de BEAS, despues de varios dias de disminucion. Este cambio pudo modificar la composicion del agua bruta y coincide con la muestra mas extrema. Planta tambien comunico que el seguimiento de la sonda habia sido limitado, por lo que no puede descartarse una incidencia instrumental. Estos hechos no permiten atribuir toda la deriva de julio a septiembre a una unica causa. El detalle se documenta en `Validation/Cambio_variables_entrada_Huelva_octubre_2026.pdf`.
+
+El bundle reentrenado con las 34 muestras puede conservarse como modelo actualizado para futuras pruebas, pero no hereda las metricas formales 27/7. Su rendimiento debe medirse con nuevas muestras futuras independientes.
+
+El modelo queda formalmente caracterizado, pero no se considera todavia listo para uso operacional.
+
+---
+
+## 11. Nueva validacion futura
+
+Cuando existan suficientes nuevas muestras THM exactas:
+
+1. actualizar la extraccion de PDF;
+2. regenerar ventanas 24 h y 72 h;
+3. descargar `par` incrementalmente;
+4. regenerar el ETL;
+5. definir el nuevo split temporal antes de observar el nuevo test;
+6. ejecutar una nueva version/directorio sin sobrescribir la referencia actual;
+7. repetir el diagnostico de deriva;
+8. repetir la transferencia Huesna solo como evidencia complementaria;
+9. actualizar `CURRENT_STABLE.md`;
+10. actualizar el informe formal.
+
+No reutilizar el test actual para seleccionar modificaciones del modelo.

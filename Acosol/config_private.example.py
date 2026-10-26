@@ -1,0 +1,7 @@
+from __future__ import annotations
+
+HOST = "REEMPLAZAR_HOST"
+PORT = 22
+USERNAME = "REEMPLAZAR_USUARIO"
+PASSWORD = "REEMPLAZAR_PASSWORD"
+ROOT_PATH = "."

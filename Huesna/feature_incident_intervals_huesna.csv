@@ -1,0 +1,2 @@
+start,end,sensor,feature,label,notes
+2026-08-29 03:00:00,2026-08-29 18:00:00,DEPOSITO ETAP MULTIPARAMETRICA,UVAS,uvas_anomaly_20260829,"Anomalía UVAS confirmada por planta; valores extraordinarios entre aproximadamente 03:00 y 18:00; sin cambios de proceso reportados."
